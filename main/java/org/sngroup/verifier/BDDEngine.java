@@ -3,16 +3,13 @@ package org.sngroup.verifier;
 import jdd.bdd.BDD;
 import jdd.bdd.BDDNames;
 import jdd.util.Allocator;
-import org.sngroup.util.CopyHelper.ReflectDeepCopy;
 import org.sngroup.util.IPPrefix;
 import org.sngroup.util.IPPrefixIPV6;
 import org.sngroup.util.Utility;
 
 import java.io.Serializable;
 import java.net.UnknownHostException;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.logging.Logger;
 
 public class BDDEngine implements Cloneable, Serializable {
@@ -25,6 +22,7 @@ public class BDDEngine implements Cloneable, Serializable {
 
     public static int BDDCnt = 0;
 
+//    public int curBdd = 0;
     public final static int BDDFalse = 0;
     public final static int BDDTrue = 1;
 
@@ -51,56 +49,52 @@ public class BDDEngine implements Cloneable, Serializable {
     static int[] vars;
 
     static int[] dstIPField;
-
-    // 缓存常用的IP前缀编码，减少重复计算
-    private static final Map<Long, Map<Integer, Integer>> ipPrefixCache = new HashMap<>();
-
     public BDDEngine(){
-        bdd = new TSBDD(new BDD(10000, 10000));
-        BDDCnt++;
-        protocol = new int[protocolBits];
-        srcPort = new int[portBits];
-        dstPort = new int[portBits];
-        srcIP = new int[ipBits];
-        dstIP = new int[ipBits];
-        dstIPField = new int[ipBits];
+//        if (bdd == null) {
+            bdd = new TSBDD(new BDD(10000, 10000));
+            BDDCnt++;
+//            System.out.println("BDDCNT   " + BDDCnt);
+//            curBdd = BDDCnt;
+            protocol = new int[protocolBits];
+            srcPort = new int[portBits];
+            dstPort = new int[portBits];
+            srcIP = new int[ipBits];
+            dstIP = new int[ipBits];
+            dstIPField = new int[ipBits];
+            /**
+             * will try more orders of variables
+             */
+            DeclareSrcIP();
+            DeclareDstIP();
+            DeclareSrcPort();
+            DeclareDstPort();
+            DeclareProtocol();
 
-        // 声明变量
-        DeclareSrcIP();
-        DeclareDstIP();
-        DeclareSrcPort();
-        DeclareDstPort();
-        DeclareProtocol();
-
-        dstIPField = AndInBatch(dstIP);
+            dstIPField = AndInBatch(dstIP);
+//        }
     }
 
-    // 优化的构造函数，用于从现有BDD创建新实例
+    public void setIpv6Param(){
+
+    }
+
+
+    // Construction function for copy
     public BDDEngine(BDDEngine srcBdd, boolean isCopy){
-        // 使用ReflectDeepCopy进行复制，这与DVNet.copyBdd中使用的方法相同
-        try {
-            if (isCopy) {
-                ReflectDeepCopy copyHelper = new ReflectDeepCopy();
-                this.bdd = (TSBDD) copyHelper.deepCopy(srcBdd.bdd);
-            } else {
-                // 如果不复制，则创建新的BDD实例
-                this.bdd = new TSBDD(new BDD(10000, 10000));
-            }
-        } catch (Exception e) {
-            System.err.println("复制BDD失败: " + e.getMessage());
-            // 创建新的BDD作为后备
-            this.bdd = new TSBDD(new BDD(10000, 10000));
-        }
+//        if (bdd == null) {
+//        bdd = new TSBDD(new BDD(10000, 10000));
+//        bdd = new TSBDD(new BDD(10000, 10000));
+        this.bdd = new TSBDD(new BDD(10000, 10000,srcBdd, isCopy));
 
-        // 初始化字段数组
         protocol = new int[protocolBits];
         srcPort = new int[portBits];
         dstPort = new int[portBits];
         srcIP = new int[ipBits];
         dstIP = new int[ipBits];
         dstIPField = new int[ipBits];
-
-        // 声明变量
+        /**
+         * will try more orders of variables
+         */
         DeclareSrcIP();
         DeclareDstIP();
         DeclareSrcPort();
@@ -108,24 +102,13 @@ public class BDDEngine implements Cloneable, Serializable {
         DeclareProtocol();
 
         dstIPField = AndInBatch(dstIP);
-
-        BDDCnt++; // 增加计数器
-    }
-
-    // 提供一个释放资源的方法
-    public void dispose() {
-        if (bdd != null && bdd.bdd != null) {
-            try {
-                bdd.bdd.cleanup(); // 清理BDD资源
-            } catch (Exception e) {
-                // 忽略清理异常
-            }
-        }
+//        }
     }
 
     @Override
     public Object clone() {
         BDDEngine bddEngineCopy = null;
+//        TSBDD copyBdd = (TSBDD) this.bdd.clone();
         try{
            bddEngineCopy = (BDDEngine) super.clone();
         }catch(CloneNotSupportedException e) {
@@ -135,6 +118,7 @@ public class BDDEngine implements Cloneable, Serializable {
         bddEngineCopy.bdd = (TSBDD)this.bdd.clone();
         return bddEngineCopy;
     }
+
 
     private void DeclareProtocol() {
         DeclareVars(protocol, protocolBits);
@@ -163,72 +147,59 @@ public class BDDEngine implements Cloneable, Serializable {
     public synchronized void printPredicate(int p){
         printSet(p);
     }
-
     public String printSet(int p)  {
         if( p < 2) {
             String result = String.format("%s", (p == 0) ? "null" : "all");
+            // System.out.println(result);
             return result;
+//            logger.info(String.format("%s\n", (p == 0) ? "null packet" : "any packet"));
+
         } else {
             StringBuilder sb = new StringBuilder();
+//            sb.append(p).append("\n");
+//            logger.info(String.valueOf(p));
 
             if(set_chars == null || set_chars.length < size)
                 set_chars = Allocator.allocateCharArray(size);
 
             printSet_rec(p, 0, sb);
+            // System.out.println(sb.toString());
             return sb.toString();
+//            System.out.print("\n");
         }
     }
-
-    // 优化的编码方法，使用缓存减少重复计算
-    public int encodeDstIPPrefix(long ipaddr, int prefixlen) {
-        // 检查缓存
-        if (ipPrefixCache.containsKey(ipaddr) && ipPrefixCache.get(ipaddr).containsKey(prefixlen)) {
-            return ipPrefixCache.get(ipaddr).get(prefixlen);
-        }
-
-        // 计算二进制表示
-        int[] ipbin = Utility.CalBinRep(ipaddr, 32);
-        int[] ipbinprefix = new int[prefixlen];
-        for (int k = 0; k < prefixlen; k++) {
-            ipbinprefix[k] = ipbin[k + 32 - prefixlen];
-        }
-
-        // 编码前缀
-        int entrybdd = EncodePrefix(ipbinprefix, dstIP, 32);
-
-        // 缓存结果
-        if (!ipPrefixCache.containsKey(ipaddr)) {
-            ipPrefixCache.put(ipaddr, new HashMap<>());
-        }
-        ipPrefixCache.get(ipaddr).put(prefixlen, entrybdd);
-
-        return entrybdd;
-    }
-
-    // 其他方法保持不变...
 
     public int encodeIpWithoutBlacklist(int bddip, List<Integer> blackList){
-        if (blackList == null || blackList.isEmpty()) {
-            return bdd.ref(bddip); // 如果没有黑名单，直接返回引用
-        }
-
         int allBlack = 0;
-        for (int blRule : blackList) {
+        // lock
+        // synchronized (bdd){
+        for(int blRule:blackList){
             allBlack = bdd.orTo(allBlack, blRule);
         }
-
         int tmp = bdd.ref(bdd.not(allBlack));
         int newHit = bdd.ref(bdd.and(bddip, tmp));
         bdd.deref(tmp);
 
+        // 垃圾回收
+        blackList = null;
         return newHit;
+        // }
     }
+
 
     private void printSet_rec(int p, int level, StringBuilder sb) {
         if(level == size) {
+//            sb.append(String.format("src IP:\"%s\", src port:\"%s\", dst IP:\"%s\", dst port:\"%s\", protocol: \"%s\"\n",
+//                        parseIP(srcIPStartIndex),
+//                        parseNumber(srcPortStartIndex, portBits),
+//                        parseIP(dstIPStartIndex),
+//                        parseNumber(dstPortStartIndex, portBits),
+//                        parseNumber(protocolStartIndex, protocolBits)
+//                    ));
             sb.append(String.format("%s;",
                     parseIP(dstIPStartIndex)
             ));
+        // todo
             return;
         }
         BDD bdd = getBDD().bdd;
@@ -286,39 +257,12 @@ public class BDDEngine implements Cloneable, Serializable {
         }
     }
 
-    // 优化的列表编码方法
     public int encodeDstIPPrefixList(List<IPPrefix> ipPrefixList){
-        if (ipPrefixList == null || ipPrefixList.isEmpty()) {
-            return BDDFalse;
+        int result = 0;
+        for(IPPrefix ipPrefix: ipPrefixList){
+            result = bdd.orTo(result, encodeDstIPPrefix(ipPrefix.ip, ipPrefix.prefix));
         }
-
-        // 对于小列表，直接计算
-        if (ipPrefixList.size() <= 3) {
-            int result = 0;
-            for (IPPrefix ipPrefix : ipPrefixList){
-                result = bdd.orTo(result, encodeDstIPPrefix(ipPrefix.ip, ipPrefix.prefix));
-            }
-            return result;
-        }
-
-        // 对于较大列表，使用分治法
-        return encodeDstIPPrefixListRecursive(ipPrefixList, 0, ipPrefixList.size() - 1);
-    }
-
-    // 递归处理大型列表
-    private int encodeDstIPPrefixListRecursive(List<IPPrefix> list, int start, int end) {
-        if (start > end) {
-            return BDDFalse;
-        }
-        if (start == end) {
-            return encodeDstIPPrefix(list.get(start).ip, list.get(start).prefix);
-        }
-
-        int mid = (start + end) / 2;
-        int left = encodeDstIPPrefixListRecursive(list, start, mid);
-        int right = encodeDstIPPrefixListRecursive(list, mid + 1, end);
-
-        return bdd.orTo(left, right);
+        return result;
     }
 
     public int encodeDstIPPrefixListIPV6(List<IPPrefixIPV6> ipPrefixList){
@@ -327,14 +271,26 @@ public class BDDEngine implements Cloneable, Serializable {
             try {
                 result = bdd.orTo(result, encodeDstIPPrefixIpv6(ipPrefix.ip, ipPrefix.prefix));
             } catch (UnknownHostException e) {
+                // TODO Auto-generated catch block
                 e.printStackTrace();
             }
         }
         return result;
     }
 
+    public int encodeDstIPPrefix(long ipaddr, int prefixlen) {
+        int[] ipbin = Utility.CalBinRep(ipaddr, 32);
+        int[] ipbinprefix = new int[prefixlen];
+        for (int k = 0; k < prefixlen; k++) {
+            ipbinprefix[k] = ipbin[k + 32 - prefixlen];
+        }
+        int entrybdd = EncodePrefix(ipbinprefix, dstIP, 32);
+        return entrybdd;
+    }
+
     public int encodeDstIPPrefixIpv6(String ipaddr, int prefixlen) throws UnknownHostException {
-        int[] ipbin = Utility.ipv6ToBinaryArray(ipaddr, ipBits);
+        int[] ipbin = new int[0];
+        ipbin = Utility.ipv6ToBinaryArray(ipaddr, ipBits);
         int[] ipbinprefix = new int[prefixlen];
         for (int k = 0; k < prefixlen; k++) {
             ipbinprefix[k] = ipbin[k + ipBits - prefixlen];
@@ -349,23 +305,28 @@ public class BDDEngine implements Cloneable, Serializable {
         }
 
         int tempnode = BDDTrue;
-        for (int i = 0; i < prefix.length; i++) {
-            if (i == 0) {
-                tempnode = EncodingVar(vars[bits - prefix.length + i],
-                        prefix[i]);
-            } else {
-                int tempnode2 = EncodingVar(vars[bits - prefix.length + i],
-                        prefix[i]);
-                int tempnode3 = bdd.ref(bdd.and(tempnode, tempnode2));
-                tempnode = tempnode3;
+//        synchronized (bdd){
+            for (int i = 0; i < prefix.length; i++) {
+                if (i == 0) {
+                    tempnode = EncodingVar(vars[bits - prefix.length + i],
+                            prefix[i]);
+                } else {
+                    int tempnode2 = EncodingVar(vars[bits - prefix.length + i],
+                            prefix[i]);
+                    int tempnode3 = bdd.ref(bdd.and(tempnode, tempnode2));
+                    tempnode = tempnode3;
+                }
             }
-        }
+//        }
         return tempnode;
     }
 
     private int EncodingVar(int var, int flag) {
         if (flag == 0) {
             int tempnode = bdd.not(var);
+            // no need to ref the negation of a variable.
+            // the ref count is already set to maximal
+            // aclBDD.ref(tempnode);
             return tempnode;
         }
         if (flag == 1) {
@@ -413,43 +374,6 @@ public class BDDEngine implements Cloneable, Serializable {
             res[bddnodes.length-i] = tempnode;
         }
         return res;
-    }
-     /**
-     * 获取BDD引擎中的节点数量
-     */
-    public int getNodeCount() {
-        if (bdd != null && bdd.bdd != null) {
-            try {
-                // 使用BDD.nodeCount方法获取节点总数
-                // 我们传入1（TRUE）作为根节点，因为我们需要从根节点开始计数
-                return bdd.bdd.nodeCount(1);
-            } catch (Exception e) {
-                try {
-                    // 如果上面的方法出错，尝试使用quasiReducedNodeCount
-                    return bdd.bdd.quasiReducedNodeCount(1);
-                } catch (Exception ex) {
-                    // 所有尝试都失败，返回默认值
-                    return 1000; // 使用一个默认估计值
-                }
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * 获取BDD引擎的内存使用估计（字节）
-     */
-    public long getEstimatedMemoryUsage() {
-        if (bdd != null && bdd.bdd != null) {
-            try {
-                // 首先尝试使用BDD自己的内存估计
-                return bdd.bdd.getMemoryUsage();
-            } catch (Exception e) {
-                // 如果失败，使用节点数*24字节的粗略估计
-                return getNodeCount() * 24L;
-            }
-        }
-        return 0;
     }
 
 }

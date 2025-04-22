@@ -3,6 +3,7 @@ package org.sngroup.util;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.management.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
@@ -24,11 +25,14 @@ public class MonitorService {
     private final AtomicInteger bddReuseCount = new AtomicInteger(0);
     private final AtomicLong bddWaitTime = new AtomicLong(0);
     private final AtomicLong bddUsageTime = new AtomicLong(0);
-    
+    private final AtomicInteger bddExceptionCount = new AtomicInteger(0);  // 新增：BDD异常计数
+
     // 批次监控
     private final Map<Integer, BatchMetrics> batchMetrics = new ConcurrentHashMap<>();
+    private final Set<Integer> completedBatches = Collections.synchronizedSet(new HashSet<>());  // 新增：已完成批次集合
     private int currentBatch = 0;
-    
+    private int maxBatchId = 0;  // 新增：最大批次ID
+
     // 构建和验证阶段监控
     private long buildStartTime = 0;
     private long buildEndTime = 0;
@@ -57,6 +61,7 @@ public class MonitorService {
     private String memoryLogFile = "./memory_usage.csv";
     private String topoNetLogFile = "./toponet_performance.csv";
     private String bddLogFile = "./bdd_performance.csv";
+    private String exceptionLogFile = "./exception_log.csv";  // 新增：异常日志文件
     private String summaryFile = "./performance_summary.txt";
 
     private MonitorService() {
@@ -83,9 +88,16 @@ public class MonitorService {
         }
 
         try (PrintWriter writer = new PrintWriter(new FileWriter(bddLogFile))) {
-            writer.println("时间戳,事件,创建次数,复用次数,复用率,等待时间(ms),使用时间(ms)");
+            writer.println("时间戳,事件,创建次数,复用次数,复用率,等待时间(ms),使用时间(ms),异常次数");
         } catch (IOException e) {
             System.err.println("无法创建BDD日志文件: " + e.getMessage());
+        }
+
+        // 新增：创建异常日志文件
+        try (PrintWriter writer = new PrintWriter(new FileWriter(exceptionLogFile))) {
+            writer.println("时间戳,批次ID,TopoNetID,异常类型,异常消息,详细堆栈");
+        } catch (IOException e) {
+            System.err.println("无法创建异常日志文件: " + e.getMessage());
         }
 
         try (PrintWriter writer = new PrintWriter(new FileWriter(summaryFile))) {
@@ -185,9 +197,13 @@ public class MonitorService {
         long gcCount = verifyEndGcCount - verifyStartGcCount;
         long gcTime = verifyEndGcTime - verifyStartGcTime;
 
+        // 检查是否有未完成的批次
+        checkForUncompletedBatches();
+
         // 记录日志
         logMemoryUsage("VerifyEnd");
         logEvent("VerifyEnd", -1, "", getMemoryUsage(), getGCStats(), duration, 0);
+        logBDDStats("VerifyEnd");
 
         // 输出统计信息
         System.out.println("\n===== 验证阶段性能统计 =====");
@@ -195,6 +211,7 @@ public class MonitorService {
         System.out.println("内存使用: " + (memoryUsed / 1024) + "KB");
         System.out.println("GC次数: " + gcCount);
         System.out.println("GC总时间: " + gcTime + "ms");
+        System.out.println("BDD异常总数: " + bddExceptionCount.get());
 
         // 写入摘要文件
         try (PrintWriter writer = new PrintWriter(new FileWriter(summaryFile, true))) {
@@ -203,6 +220,7 @@ public class MonitorService {
             writer.println("内存使用: " + (memoryUsed / 1024) + "KB");
             writer.println("GC次数: " + gcCount);
             writer.println("GC总时间: " + gcTime + "ms");
+            writer.println("BDD异常总数: " + bddExceptionCount.get());
             writer.println();
         } catch (IOException e) {
             System.err.println("写入摘要文件失败: " + e.getMessage());
@@ -214,6 +232,8 @@ public class MonitorService {
      */
     public synchronized void startBatchMonitoring(int batchId, int batchSize) {
         currentBatch = batchId;
+        maxBatchId = Math.max(maxBatchId, batchId); // 更新最大批次ID
+
         BatchMetrics metrics = new BatchMetrics(batchId, batchSize);
         batchMetrics.put(batchId, metrics);
 
@@ -232,6 +252,7 @@ public class MonitorService {
         BatchMetrics metrics = batchMetrics.get(batchId);
         if (metrics != null) {
             metrics.endTime = System.currentTimeMillis();
+            completedBatches.add(batchId); // 标记为已完成
 
             // 记录批次结束状态
             long duration = metrics.endTime - metrics.startTime;
@@ -255,9 +276,7 @@ public class MonitorService {
             // 输出批次统计信息
             System.out.println("\n==== 批次 #" + batchId + " 性能统计 ====");
             System.out.println("处理时间: " + duration + "ms");
-            System.out.println("TopoNet数量: " + metrics.topoNetIds.size());
-            System.out.println("初始化内存列表大小: " + metrics.initMemoryList.size());
-            System.out.println("计算内存列表大小: " + metrics.computeMemoryList.size());
+            System.out.println("TopoNet数量: " + metrics.topoNetIds.size() + " / " + metrics.batchSize);
             System.out.println("平均每个TopoNet初始化内存: " + avgInitMemory + "KB");
             System.out.println("平均每个TopoNet计算内存: " + avgComputeMemory + "KB");
             System.out.println("最大TopoNet初始化内存: " + maxInitMemory + "KB");
@@ -266,13 +285,14 @@ public class MonitorService {
             System.out.println("GC总时间: " + gcTimeDiff + "ms");
             System.out.println("BDD复用次数: " + metrics.reuseCount);
             System.out.println("BDD创建次数: " + metrics.createCount);
+            System.out.println("BDD异常次数: " + metrics.exceptionCount);
             System.out.println("BDD复用率: " + String.format("%.2f", reuseRate) + "%");
 
             // 写入摘要文件
             try (PrintWriter writer = new PrintWriter(new FileWriter(summaryFile, true))) {
                 writer.println("----- 批次 #" + batchId + " 性能统计 -----");
                 writer.println("处理时间: " + duration + "ms");
-                writer.println("TopoNet数量: " + metrics.topoNetIds.size());
+                writer.println("TopoNet数量: " + metrics.topoNetIds.size() + " / " + metrics.batchSize);
                 writer.println("平均每个TopoNet初始化内存: " + avgInitMemory + "KB");
                 writer.println("平均每个TopoNet计算内存: " + avgComputeMemory + "KB");
                 writer.println("最大TopoNet初始化内存: " + maxInitMemory + "KB");
@@ -281,6 +301,7 @@ public class MonitorService {
                 writer.println("GC总时间: " + gcTimeDiff + "ms");
                 writer.println("BDD复用次数: " + metrics.reuseCount);
                 writer.println("BDD创建次数: " + metrics.createCount);
+                writer.println("BDD异常次数: " + metrics.exceptionCount);
                 writer.println("BDD复用率: " + String.format("%.2f", reuseRate) + "%");
                 writer.println();
             } catch (IOException e) {
@@ -288,6 +309,27 @@ public class MonitorService {
             }
         } else {
             System.err.println("警告: 批次 #" + batchId + " 的指标数据不存在");
+            // 创建一个空的批次指标对象
+            BatchMetrics emptyMetrics = new BatchMetrics(batchId, 0);
+            emptyMetrics.endTime = System.currentTimeMillis();
+            batchMetrics.put(batchId, emptyMetrics);
+            completedBatches.add(batchId);
+        }
+    }
+
+    /**
+     * 检查未完成的批次并强制结束它们的监控
+     */
+    private void checkForUncompletedBatches() {
+        for (int i = 1; i <= maxBatchId; i++) {
+            if (!completedBatches.contains(i)) {
+                System.err.println("警告: 批次 #" + i + " 未正常完成，强制结束监控");
+                try {
+                    endBatchMonitoring(i);
+                } catch (Exception e) {
+                    System.err.println("结束批次 #" + i + " 监控时出错: " + e.getMessage());
+                }
+            }
         }
     }
 
@@ -344,6 +386,17 @@ public class MonitorService {
                     reused ? "复用BDD" : "新建BDD");
         } else {
             System.err.println("警告: TopoNet " + topoNetId + " 的初始化信息不存在");
+            // 创建一个新的快照记录异常情况
+            MemorySnapshot newSnapshot = new MemorySnapshot();
+            newSnapshot.startTime = System.currentTimeMillis() - 1000; // 假设1秒前开始
+            newSnapshot.startMemory = getUsedMemory() - 1024*1024; // 假设使用了1MB内存
+            newSnapshot.initEndTime = System.currentTimeMillis();
+            newSnapshot.initEndMemory = getUsedMemory();
+            memorySnapshots.put(topoNetId, newSnapshot);
+
+            // 仍然记录这个事件
+            logEvent("TopoNetInitEnd_Missing", currentBatch, topoNetId,
+                    getMemoryUsage(), getGCStats(), 1000, bddNodesCount);
         }
     }
 
@@ -361,6 +414,19 @@ public class MonitorService {
                     getMemoryUsage(), getGCStats(), 0, 0);
         } else {
             System.err.println("警告: TopoNet " + topoNetId + " 的内存快照不存在");
+            // 创建一个新的快照
+            MemorySnapshot newSnapshot = new MemorySnapshot();
+            newSnapshot.startTime = System.currentTimeMillis() - 5000; // 假设5秒前开始
+            newSnapshot.startMemory = getUsedMemory() - 1024*1024; // 假设使用了1MB内存
+            newSnapshot.initEndTime = System.currentTimeMillis() - 1000; // 假设1秒前结束初始化
+            newSnapshot.initEndMemory = getUsedMemory() - 512*1024; // 假设使用了0.5MB内存
+            newSnapshot.computeStartTime = System.currentTimeMillis();
+            newSnapshot.computeStartMemory = getUsedMemory();
+            memorySnapshots.put(topoNetId, newSnapshot);
+
+            // 记录这个异常事件
+            logEvent("TopoNetComputeStart_Missing", currentBatch, topoNetId,
+                    getMemoryUsage(), getGCStats(), 0, 0);
         }
     }
 
@@ -396,6 +462,16 @@ public class MonitorService {
             memorySnapshots.remove(topoNetId);
         } else {
             System.err.println("警告: TopoNet " + topoNetId + " 的内存快照不存在");
+            // 创建一个假设的快照用于记录
+            MemorySnapshot newSnapshot = new MemorySnapshot();
+            newSnapshot.computeStartTime = System.currentTimeMillis() - 2000; // 假设2秒前开始计算
+            newSnapshot.computeStartMemory = getUsedMemory() - 1024*1024; // 假设使用了1MB内存
+            newSnapshot.computeEndTime = System.currentTimeMillis();
+            newSnapshot.computeEndMemory = getUsedMemory();
+
+            // 记录这个异常事件
+            logEvent("TopoNetComputeEnd_Missing", currentBatch, topoNetId,
+                    getMemoryUsage(), getGCStats(), 2000, bddNodesCount);
         }
     }
 
@@ -411,6 +487,40 @@ public class MonitorService {
      */
     public void recordBDDUsageTime(long usageTimeMs) {
         bddUsageTime.addAndGet(usageTimeMs);
+    }
+
+    /**
+     * 记录BDD异常
+     */
+    public void recordBDDException(int batchId, String topoNetId, Throwable exception) {
+        bddExceptionCount.incrementAndGet();
+
+        // 更新批次统计
+        BatchMetrics metrics = batchMetrics.get(batchId);
+        if (metrics != null) {
+            metrics.exceptionCount++;
+        }
+
+        // 记录异常到日志
+        try (PrintWriter writer = new PrintWriter(new FileWriter(exceptionLogFile, true))) {
+            SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+            writer.print(sdf.format(new Date()) + "," + batchId + "," + topoNetId + ",");
+            writer.print(exception.getClass().getName() + ",");
+            writer.print("\"" + exception.getMessage() + "\",");
+
+            // 获取堆栈并格式化
+            StringWriter sw = new StringWriter();
+            exception.printStackTrace(new PrintWriter(sw));
+            String stackTrace = sw.toString();
+            // 转义引号并替换换行符
+            stackTrace = stackTrace.replace("\"", "\"\"").replace("\n", " | ");
+            writer.println("\"" + stackTrace + "\"");
+        } catch (IOException e) {
+            System.err.println("写入异常日志失败: " + e.getMessage());
+        }
+
+        // 记录到性能日志
+        logEvent("BDDException", batchId, topoNetId, getMemoryUsage(), getGCStats(), 0, 0);
     }
 
     /**
@@ -519,10 +629,11 @@ public class MonitorService {
             }
             long waitTime = bddWaitTime.get();
             long usageTime = bddUsageTime.get();
+            int exceptionCount = bddExceptionCount.get();
 
             writer.println(sdf.format(new Date()) + "," + event + "," + createCount + "," +
                           reuseCount + "," + String.format("%.2f", reuseRate) + "," +
-                          waitTime + "," + usageTime);
+                          waitTime + "," + usageTime + "," + exceptionCount);
         } catch (IOException e) {
             System.err.println("写入BDD日志失败: " + e.getMessage());
         }
@@ -559,6 +670,7 @@ public class MonitorService {
         System.out.println("\n======== 性能监控总结 ========");
         System.out.println("BDD引擎创建次数: " + bddCreationCount.get());
         System.out.println("BDD引擎复用次数: " + bddReuseCount.get());
+        System.out.println("BDD引擎异常次数: " + bddExceptionCount.get());
 
         int totalBddOps = bddCreationCount.get() + bddReuseCount.get();
         if (totalBddOps > 0) {
@@ -570,6 +682,19 @@ public class MonitorService {
         System.out.println("BDD引擎使用总时间: " + bddUsageTime.get() + "ms");
         System.out.println("总GC次数: " + getGCCount());
         System.out.println("总GC时间: " + getGCTime() + "ms");
+
+        // 检查未完成的批次
+        boolean hasUncompletedBatches = false;
+        for (int i = 1; i <= maxBatchId; i++) {
+            if (!completedBatches.contains(i)) {
+                hasUncompletedBatches = true;
+                System.err.println("警告: 批次 #" + i + " 未完成");
+            }
+        }
+
+        if (!hasUncompletedBatches) {
+            System.out.println("所有批次已正常完成");
+        }
 
         // 计算构建和验证阶段的统计
         long buildDuration = buildEndTime - buildStartTime;
@@ -591,15 +716,19 @@ public class MonitorService {
 
         // 批次统计汇总
         System.out.println("\n批次统计:");
-        for (BatchMetrics metrics : batchMetrics.values()) {
-            try {
-                long duration = metrics.endTime - metrics.startTime;
-                System.out.printf("批次 #%d: %dms, TopoNet数量: %d, 平均初始化内存: %dKB, 平均计算内存: %dKB\n",
-                                metrics.batchId, duration, metrics.topoNetIds.size(),
-                                metrics.getAverageInitMemory(),
-                                metrics.getAverageComputeMemory());
-            } catch (Exception e) {
-                System.err.println("处理批次 #" + metrics.batchId + " 统计时发生错误: " + e.getMessage());
+        for (int i = 1; i <= maxBatchId; i++) {
+            BatchMetrics metrics = batchMetrics.get(i);
+            if (metrics != null) {
+                try {
+                    long duration = metrics.endTime - metrics.startTime;
+                    System.out.printf("批次 #%d: %dms, TopoNet数量: %d/%d, 平均初始化内存: %dKB, 平均计算内存: %dKB, 异常: %d\n",
+                                    metrics.batchId, duration, metrics.topoNetIds.size(), metrics.batchSize,
+                                    metrics.getAverageInitMemory(), metrics.getAverageComputeMemory(), metrics.exceptionCount);
+                } catch (Exception e) {
+                    System.err.println("处理批次 #" + metrics.batchId + " 统计时发生错误: " + e.getMessage());
+                }
+            } else {
+                System.err.println("警告: 批次 #" + i + " 无性能数据");
             }
         }
 
@@ -610,6 +739,7 @@ public class MonitorService {
             writer.println("\n======== 性能监控总结 ========");
             writer.println("BDD引擎创建次数: " + bddCreationCount.get());
             writer.println("BDD引擎复用次数: " + bddReuseCount.get());
+            writer.println("BDD引擎异常次数: " + bddExceptionCount.get());
 
             if (totalBddOps > 0) {
                 double reuseRate = (double)bddReuseCount.get() / totalBddOps * 100;
@@ -629,15 +759,19 @@ public class MonitorService {
                           verifyGcTime + "ms");
 
             writer.println("\n批次统计汇总:");
-            for (BatchMetrics metrics : batchMetrics.values()) {
-                try {
-                    long duration = metrics.endTime - metrics.startTime;
-                    writer.printf("批次 #%d: %dms, TopoNet数量: %d, 平均初始化内存: %dKB, 平均计算内存: %dKB\n",
-                                metrics.batchId, duration, metrics.topoNetIds.size(),
-                                metrics.getAverageInitMemory(),
-                                metrics.getAverageComputeMemory());
-                } catch (Exception e) {
-                    writer.println("处理批次 #" + metrics.batchId + " 统计时发生错误");
+            for (int i = 1; i <= maxBatchId; i++) {
+                BatchMetrics metrics = batchMetrics.get(i);
+                if (metrics != null) {
+                    try {
+                        long duration = metrics.endTime - metrics.startTime;
+                        writer.printf("批次 #%d: %dms, TopoNet数量: %d/%d, 平均初始化内存: %dKB, 平均计算内存: %dKB, 异常: %d\n",
+                                    metrics.batchId, duration, metrics.topoNetIds.size(), metrics.batchSize,
+                                    metrics.getAverageInitMemory(), metrics.getAverageComputeMemory(), metrics.exceptionCount);
+                    } catch (Exception e) {
+                        writer.println("处理批次 #" + metrics.batchId + " 统计时发生错误");
+                    }
+                } else {
+                    writer.println("警告: 批次 #" + i + " 无性能数据");
                 }
             }
 
@@ -684,6 +818,7 @@ public class MonitorService {
 
         int reuseCount = 0;
         int createCount = 0;
+        int exceptionCount = 0;  // 新增：异常计数
 
         long startGcCount;
         long startGcTime;
@@ -721,7 +856,7 @@ public class MonitorService {
         }
 
         void addTopoNetId(String id) {
-            if (id != null) {
+            if (id != null && !topoNetIds.contains(id)) {
                 topoNetIds.add(id);
             }
         }

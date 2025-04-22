@@ -1,0 +1,601 @@
+package org.sngroup.test.performance;
+
+import java.io.*;
+import java.lang.management.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
+import javax.management.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.GarbageCollectorMXBean;
+
+/**
+ * 监控BDD性能，包括内存使用和GC情况
+ */
+public class PerformanceMonitor {
+    // 单例模式
+    private static PerformanceMonitor instance;
+    
+    // 监控数据
+    private final MemoryMXBean memoryMXBean;
+    private final List<GarbageCollectorMXBean> gcBeans;
+    private final Map<String, Long> gcCounts = new ConcurrentHashMap<>();
+    private final Map<String, Long> gcTimes = new ConcurrentHashMap<>();
+    
+    // 性能数据记录
+    private PrintWriter perfWriter;
+    private PrintWriter topoNetWriter;
+    private PrintWriter batchWriter;
+    
+    // 计时器
+    private long startTime;
+    private final AtomicLong topoNetIdCounter = new AtomicLong(0);
+    private final AtomicLong batchIdCounter = new AtomicLong(0);
+    
+    // 批次和TopoNet信息
+    private final Map<Long, BatchInfo> batchInfoMap = new HashMap<>();
+    private final Map<Long, TopoNetInfo> topoNetInfoMap = new HashMap<>();
+
+    /**
+     * 批次信息
+     */
+    public static class BatchInfo {
+        public long id;
+        public int size;
+        public long startTime;
+        public long endTime;
+        public long initMemoryUsed;
+        public long peakMemoryUsed;
+        public long finalMemoryUsed;
+        public int gcCount;
+        public long gcTime;
+        
+        @Override
+        public String toString() {
+            return String.format("%d,%d,%d,%d,%d,%d,%d,%d,%d", 
+                id, size, startTime, endTime, initMemoryUsed, 
+                peakMemoryUsed, finalMemoryUsed, gcCount, gcTime);
+        }
+    }
+    
+    /**
+     * TopoNet信息
+     */
+    public static class TopoNetInfo {
+        public long id;
+        public String name;
+        public long batchId;
+        public long startTime;
+        public long endTime;
+        public long initMemoryUsed;
+        public long peakMemoryUsed;
+        public long finalMemoryUsed;
+        public boolean reuseEngine;
+        
+        @Override
+        public String toString() {
+            return String.format("%d,%s,%d,%d,%d,%d,%d,%d,%b", 
+                id, name, batchId, startTime, endTime, initMemoryUsed, 
+                peakMemoryUsed, finalMemoryUsed, reuseEngine);
+        }
+    }
+
+    private PerformanceMonitor() {
+        // 获取内存和GC监控接口
+        memoryMXBean = ManagementFactory.getMemoryMXBean();
+        gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
+        
+        // 初始化GC计数器
+        for (GarbageCollectorMXBean gcBean : gcBeans) {
+            gcCounts.put(gcBean.getName(), gcBean.getCollectionCount());
+            gcTimes.put(gcBean.getName(), gcBean.getCollectionTime());
+        }
+        
+        try {
+            // 创建性能数据文件
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            File outputDir = new File("performance_results_" + timestamp);
+            if (!outputDir.exists()) {
+                outputDir.mkdir();
+            }
+            
+            perfWriter = new PrintWriter(new FileWriter(new File(outputDir, "performance.csv")));
+            topoNetWriter = new PrintWriter(new FileWriter(new File(outputDir, "toponet_metrics.csv")));
+            batchWriter = new PrintWriter(new FileWriter(new File(outputDir, "batch_metrics.csv")));
+            
+            // 写入CSV头
+            perfWriter.println("timestamp,heapUsed,heapCommitted,nonHeapUsed,nonHeapCommitted,gcCount,gcTime");
+            topoNetWriter.println("id,name,batchId,startTime,endTime,initMemoryUsed,peakMemoryUsed,finalMemoryUsed,reuseEngine");
+            batchWriter.println("id,size,startTime,endTime,initMemoryUsed,peakMemoryUsed,finalMemoryUsed,gcCount,gcTime");
+            
+            startTime = System.currentTimeMillis();
+        } catch (IOException e) {
+            System.err.println("Failed to initialize performance monitor: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    /**
+     * 获取PerformanceMonitor实例
+     */
+    public static synchronized PerformanceMonitor getInstance() {
+        if (instance == null) {
+            instance = new PerformanceMonitor();
+        }
+        return instance;
+    }
+    
+    /**
+     * 记录当前性能数据
+     */
+    public void recordCurrentPerformance() {
+        long timestamp = System.currentTimeMillis() - startTime;
+        long heapUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+        long heapCommitted = memoryMXBean.getHeapMemoryUsage().getCommitted();
+        long nonHeapUsed = memoryMXBean.getNonHeapMemoryUsage().getUsed();
+        long nonHeapCommitted = memoryMXBean.getNonHeapMemoryUsage().getCommitted();
+        
+        // 计算GC计数和时间
+        long totalGcCount = 0;
+        long totalGcTime = 0;
+        
+        for (GarbageCollectorMXBean gcBean : gcBeans) {
+            long currentCount = gcBean.getCollectionCount();
+            long previousCount = gcCounts.getOrDefault(gcBean.getName(), 0L);
+            long count = currentCount - previousCount;
+            totalGcCount += count;
+            gcCounts.put(gcBean.getName(), currentCount);
+            
+            long currentTime = gcBean.getCollectionTime();
+            long previousTime = gcTimes.getOrDefault(gcBean.getName(), 0L);
+            long time = currentTime - previousTime;
+            totalGcTime += time;
+            gcTimes.put(gcBean.getName(), currentTime);
+        }
+        
+        // 写入性能数据
+        perfWriter.println(String.format("%d,%d,%d,%d,%d,%d,%d", 
+                timestamp, heapUsed, heapCommitted, nonHeapUsed, nonHeapCommitted, totalGcCount, totalGcTime));
+        perfWriter.flush();
+    }
+    
+    /**
+     * 开始监控批次
+     */
+    public long startBatchMonitoring(int size) {
+        long batchId = batchIdCounter.incrementAndGet();
+        BatchInfo batchInfo = new BatchInfo();
+        batchInfo.id = batchId;
+        batchInfo.size = size;
+        batchInfo.startTime = System.currentTimeMillis() - startTime;
+        batchInfo.initMemoryUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+        batchInfo.peakMemoryUsed = batchInfo.initMemoryUsed;
+        
+        // 重置GC计数器
+        for (GarbageCollectorMXBean gcBean : gcBeans) {
+            gcCounts.put(gcBean.getName(), gcBean.getCollectionCount());
+            gcTimes.put(gcBean.getName(), gcBean.getCollectionTime());
+        }
+        
+        batchInfoMap.put(batchId, batchInfo);
+        return batchId;
+    }
+    
+    /**
+     * 更新批次内存使用
+     */
+    public void updateBatchMemoryUsage(long batchId) {
+        BatchInfo batchInfo = batchInfoMap.get(batchId);
+        if (batchInfo != null) {
+            long currentUsage = memoryMXBean.getHeapMemoryUsage().getUsed();
+            batchInfo.peakMemoryUsed = Math.max(batchInfo.peakMemoryUsed, currentUsage);
+        }
+    }
+    
+    /**
+     * 结束批次监控
+     */
+    public void endBatchMonitoring(long batchId) {
+        BatchInfo batchInfo = batchInfoMap.get(batchId);
+        if (batchInfo != null) {
+            batchInfo.endTime = System.currentTimeMillis() - startTime;
+            batchInfo.finalMemoryUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+            
+            // 计算批次期间的GC情况
+            long gcCount = 0;
+            long gcTime = 0;
+            
+            for (GarbageCollectorMXBean gcBean : gcBeans) {
+                long currentCount = gcBean.getCollectionCount();
+                long previousCount = gcCounts.getOrDefault(gcBean.getName(), 0L);
+                gcCount += (currentCount - previousCount);
+                
+                long currentTime = gcBean.getCollectionTime();
+                long previousTime = gcTimes.getOrDefault(gcBean.getName(), 0L);
+                gcTime += (currentTime - previousTime);
+            }
+            
+            batchInfo.gcCount = (int)gcCount;
+            batchInfo.gcTime = gcTime;
+            
+            // 写入批次信息
+            batchWriter.println(batchInfo.toString());
+            batchWriter.flush();
+        }
+    }
+    
+    /**
+     * 开始监控TopoNet
+     */
+    public long startTopoNetMonitoring(String topoNetName, long batchId, boolean reuseEngine) {
+        long topoNetId = topoNetIdCounter.incrementAndGet();
+        TopoNetInfo info = new TopoNetInfo();
+        info.id = topoNetId;
+        info.name = topoNetName;
+        info.batchId = batchId;
+        info.startTime = System.currentTimeMillis() - startTime;
+        info.initMemoryUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+        info.peakMemoryUsed = info.initMemoryUsed;
+        info.reuseEngine = reuseEngine;
+        
+        topoNetInfoMap.put(topoNetId, info);
+        return topoNetId;
+    }
+    
+    /**
+     * 更新TopoNet内存使用
+     */
+    public void updateTopoNetMemoryUsage(long topoNetId) {
+        TopoNetInfo info = topoNetInfoMap.get(topoNetId);
+        if (info != null) {
+            long currentUsage = memoryMXBean.getHeapMemoryUsage().getUsed();
+            info.peakMemoryUsed = Math.max(info.peakMemoryUsed, currentUsage);
+            
+            // 同时更新批次的峰值内存
+            BatchInfo batchInfo = batchInfoMap.get(info.batchId);
+            if (batchInfo != null) {
+                batchInfo.peakMemoryUsed = Math.max(batchInfo.peakMemoryUsed, currentUsage);
+            }
+        }
+    }
+    
+    /**
+     * 结束TopoNet监控
+     */
+    public void endTopoNetMonitoring(long topoNetId) {
+        TopoNetInfo info = topoNetInfoMap.get(topoNetId);
+        if (info != null) {
+            info.endTime = System.currentTimeMillis() - startTime;
+            info.finalMemoryUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+            
+            // 写入TopoNet信息
+            topoNetWriter.println(info.toString());
+            topoNetWriter.flush();
+        }
+    }
+    
+    /**
+     * 生成性能报告摘要
+     */
+    public void generateSummaryReport() {
+        try {
+            PrintWriter summaryWriter = new PrintWriter(new FileWriter("performance_summary.txt"));
+            
+            // 总体统计
+            summaryWriter.println("==== BDD性能评估摘要 ====");
+            summaryWriter.println("总运行时间: " + (System.currentTimeMillis() - startTime) + " ms");
+            summaryWriter.println("处理的批次数: " + batchIdCounter.get());
+            summaryWriter.println("处理的TopoNet数: " + topoNetIdCounter.get());
+            summaryWriter.println();
+            
+            // 批次统计
+            summaryWriter.println("==== 批次处理统计 ====");
+            if (!batchInfoMap.isEmpty()) {
+                double avgBatchTime = batchInfoMap.values().stream()
+                        .mapToLong(b -> b.endTime - b.startTime)
+                        .average()
+                        .orElse(0);
+                double avgBatchMemory = batchInfoMap.values().stream()
+                        .mapToLong(b -> b.peakMemoryUsed - b.initMemoryUsed)
+                        .average()
+                        .orElse(0);
+                double avgGcTime = batchInfoMap.values().stream()
+                        .mapToLong(b -> b.gcTime)
+                        .average()
+                        .orElse(0);
+                
+                summaryWriter.println("平均批次处理时间: " + avgBatchTime + " ms");
+                summaryWriter.println("平均批次内存增长: " + (avgBatchMemory / (1024 * 1024)) + " MB");
+                summaryWriter.println("平均批次GC时间: " + avgGcTime + " ms");
+                summaryWriter.println();
+            }
+            
+            // TopoNet统计
+            summaryWriter.println("==== TopoNet处理统计 ====");
+            if (!topoNetInfoMap.isEmpty()) {
+                // 计算复用和非复用引擎的性能差异
+                Map<Boolean, List<TopoNetInfo>> groupedByReuse = new HashMap<>();
+                groupedByReuse.put(true, new ArrayList<>());
+                groupedByReuse.put(false, new ArrayList<>());
+                
+                for (TopoNetInfo info : topoNetInfoMap.values()) {
+                    groupedByReuse.get(info.reuseEngine).add(info);
+                }
+                
+                summaryWriter.println("复用BDD引擎的TopoNet: " + groupedByReuse.get(true).size());
+                summaryWriter.println("非复用BDD引擎的TopoNet: " + groupedByReuse.get(false).size());
+                
+                if (!groupedByReuse.get(true).isEmpty() && !groupedByReuse.get(false).isEmpty()) {
+                    double avgTimeWithReuse = groupedByReuse.get(true).stream()
+                            .mapToLong(i -> i.endTime - i.startTime)
+                            .average()
+                            .orElse(0);
+                    double avgTimeWithoutReuse = groupedByReuse.get(false).stream()
+                            .mapToLong(i -> i.endTime - i.startTime)
+                            .average()
+                            .orElse(0);
+                    
+                    double avgMemoryWithReuse = groupedByReuse.get(true).stream()
+                            .mapToLong(i -> i.peakMemoryUsed - i.initMemoryUsed)
+                            .average()
+                            .orElse(0);
+                    double avgMemoryWithoutReuse = groupedByReuse.get(false).stream()
+                            .mapToLong(i -> i.peakMemoryUsed - i.initMemoryUsed)
+                            .average()
+                            .orElse(0);
+                    
+                    summaryWriter.println("复用引擎平均处理时间: " + avgTimeWithReuse + " ms");
+                    summaryWriter.println("非复用引擎平均处理时间: " + avgTimeWithoutReuse + " ms");
+                    summaryWriter.println("时间性能提升: " + 
+                            String.format("%.2f", (avgTimeWithoutReuse - avgTimeWithReuse) / avgTimeWithoutReuse * 100) + "%");
+                    
+                    summaryWriter.println("复用引擎平均内存增长: " + (avgMemoryWithReuse / (1024 * 1024)) + " MB");
+                    summaryWriter.println("非复用引擎平均内存增长: " + (avgMemoryWithoutReuse / (1024 * 1024)) + " MB");
+                    summaryWriter.println("内存效率提升: " + 
+                            String.format("%.2f", (avgMemoryWithoutReuse - avgMemoryWithReuse) / avgMemoryWithoutReuse * 100) + "%");
+                }
+            }
+            
+            summaryWriter.close();
+            System.out.println("性能报告摘要已生成: performance_summary.txt");
+        } catch (IOException e) {
+            System.err.println("Failed to generate summary report: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    /**
+     * 关闭性能监控
+     */
+    public void close() {
+        generateSummaryReport();
+        
+        if (perfWriter != null) {
+            perfWriter.close();
+        }
+        if (topoNetWriter != null) {
+            topoNetWriter.close();
+        }
+        if (batchWriter != null) {
+            batchWriter.close();
+        }
+    }
+}
+
+
+
+
+package org.sngroup.test.performance;
+
+import org.sngroup.Configuration;
+import org.sngroup.test.evaluator.BurstEvaluator;
+import org.sngroup.test.runner.Runner;
+import net.sourceforge.argparse4j.inf.Namespace;
+import net.sourceforge.argparse4j.impl.Arguments;
+import net.sourceforge.argparse4j.inf.ArgumentParser;
+import net.sourceforge.argparse4j.inf.ArgumentParserException;
+import net.sourceforge.argparse4j.ArgumentParsers;
+
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * BDDFactory复用性能评估器
+ * 通过不同的批次大小和BDD引擎数量组合进行评估
+ */
+public class BDDPerformanceEvaluator {
+    private PerformanceMonitor monitor;
+    private ScheduledExecutorService scheduler;
+    private PrintWriter configWriter;
+    
+    // 待测试的参数组合
+    private List<TestConfig> configurations = new ArrayList<>();
+    
+    // 测试配置类
+    public static class TestConfig {
+        public String networkName;
+        public int batchSize;
+        public int engineCount;
+        
+        public TestConfig(String networkName, int batchSize, int engineCount) {
+            this.networkName = networkName;
+            this.batchSize = batchSize;
+            this.engineCount = engineCount;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("网络: %s, 批次大小: %d, 引擎数: %d", 
+                networkName, batchSize, engineCount);
+        }
+    }
+    
+    /**
+     * 主方法
+     */
+    public static void main(String[] args) {
+        // 解析命令行参数
+        ArgumentParser parser = ArgumentParsers.newFor("BDDPerformanceEvaluator").build()
+                .defaultHelp(true)
+                .description("评估BDDFactory复用的性能");
+        
+        parser.addArgument("--network")
+                .required(true)
+                .type(String.class)
+                .help("网络配置目录名");
+        
+        parser.addArgument("--batch-sizes")
+                .type(String.class)
+                .setDefault("5,10,20")
+                .help("要测试的批次大小，用逗号分隔");
+        
+        parser.addArgument("--engine-counts")
+                .type(String.class)
+                .setDefault("2,5,10")
+                .help("要测试的BDD引擎数量，用逗号分隔");
+        
+        parser.addArgument("--monitor-interval")
+                .type(Integer.class)
+                .setDefault(1000)
+                .help("性能监控间隔(毫秒)");
+        
+        try {
+            Namespace ns = parser.parseArgs(args);
+            BDDPerformanceEvaluator evaluator = new BDDPerformanceEvaluator();
+            evaluator.setupConfigurations(
+                    ns.getString("network"),
+                    ns.getString("batch_sizes"),
+                    ns.getString("engine_counts"),
+                    ns.getInt("monitor_interval"));
+            evaluator.runAllTests();
+        } catch (ArgumentParserException e) {
+            parser.handleError(e);
+            System.exit(1);
+        } catch (Exception e) {
+            System.err.println("评估过程出错: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+    
+    /**
+     * 设置要测试的参数组合
+     */
+    public void setupConfigurations(String networkName, String batchSizes, String engineCounts, int monitorInterval) throws IOException {
+        // 初始化性能监控
+        monitor = PerformanceMonitor.getInstance();
+        
+        // 设置定时性能监控
+        scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(() -> {
+            monitor.recordCurrentPerformance();
+        }, 0, monitorInterval, TimeUnit.MILLISECONDS);
+        
+        // 解析批次大小和引擎数
+        String[] batchSizeArray = batchSizes.split(",");
+        String[] engineCountArray = engineCounts.split(",");
+        
+        // 创建测试配置
+        for (String batchSize : batchSizeArray) {
+            for (String engineCount : engineCountArray) {
+                configurations.add(new TestConfig(
+                        networkName, 
+                        Integer.parseInt(batchSize.trim()), 
+                        Integer.parseInt(engineCount.trim())
+                ));
+            }
+        }
+        
+        // 创建配置记录文件
+        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        configWriter = new PrintWriter(new FileWriter("test_configurations_" + timestamp + ".txt"));
+        configWriter.println("==== BDD性能评估配置 ====");
+        configWriter.println("网络名称: " + networkName);
+        configWriter.println("测试时间: " + new Date());
+        configWriter.println("监控间隔: " + monitorInterval + " ms");
+        configWriter.println("\n==== 测试配置列表 ====");
+        
+        for (int i = 0; i < configurations.size(); i++) {
+            configWriter.println("配置 #" + (i+1) + ": " + configurations.get(i));
+        }
+        configWriter.println("\n==== 测试日志 ====");
+        configWriter.flush();
+    }
+    
+    /**
+     * 运行所有测试
+     */
+    public void runAllTests() {
+        System.out.println("开始BDD性能评估，共" + configurations.size() + "组配置...");
+        
+        int testCount = 1;
+        for (TestConfig config : configurations) {
+            System.out.println("\n运行测试配置 #" + testCount + "/" + configurations.size() + ": " + config);
+            configWriter.println("\n测试配置 #" + testCount + ": " + config + " 开始时间: " + new Date());
+            configWriter.flush();
+            
+            try {
+                runTest(config);
+                System.gc(); // 运行GC以清理内存
+                Thread.sleep(5000); // 等待GC完成并稳定
+                
+                configWriter.println("测试配置 #" + testCount + " 完成时间: " + new Date());
+                configWriter.flush();
+            } catch (Exception e) {
+                System.err.println("测试配置 #" + testCount + " 执行失败: " + e.getMessage());
+                e.printStackTrace();
+                
+                configWriter.println("测试配置 #" + testCount + " 执行失败: " + e.getMessage());
+                configWriter.flush();
+            }
+            
+            testCount++;
+        }
+        
+        // 关闭监控
+        scheduler.shutdown();
+        monitor.close();
+        configWriter.close();
+        
+        System.out.println("\n所有测试完成！性能数据已保存。");
+    }
+    
+    /**
+     * 运行单个测试配置
+     */
+    private void runTest(TestConfig config) throws Exception {
+        // 使用模拟命令行参数创建Namespace
+        String[] args = new String[] {
+            "--network", config.networkName,
+            "--times", "1",
+            "--thread_pool_size", "40",  // 使用固定的线程池大小
+            "--show_result", "--show_middle_result"
+        };
+        
+        ArgumentParser parser = ArgumentParsers.newFor("Test").build();
+        parser.addArgument("network").type(String.class);
+        parser.addArgument("--times").type(Integer.class).setDefault(1);
+        parser.addArgument("--thread_pool_size").type(Integer.class).setDefault(40);
+        parser.addArgument("--show_result").action(Arguments.storeTrue());
+        parser.addArgument("--show_middle_result").action(Arguments.storeTrue());
+        
+        Namespace namespace = parser.parseArgs(args);
+        
+        // 创建评估器和运行器
+        BurstEvaluator evaluator = new BurstEvaluator(namespace);
+        TopoRunnerWithMonitoring runner = new TopoRunnerWithMonitoring();
+        runner.setBatchParameters(config.batchSize, config.engineCount);
+        
+        // 运行测试
+        evaluator.start(runner);
+    }
+}

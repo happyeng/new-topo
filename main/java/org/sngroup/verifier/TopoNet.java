@@ -7,7 +7,6 @@ import org.sngroup.util.*;
 
 import java.util.*;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
 
 public class TopoNet extends DVNet {
 
@@ -76,34 +75,19 @@ public class TopoNet extends DVNet {
         return this.nodesTable.get(deviceName);
     }
 
-    // 修改此方法以增强BDD复用
     public Boolean getAndSetBddEngine(LinkedBlockingDeque<BDDEngine> sharedQue) {
         boolean reused = false;
-        try {
-            long startTime = System.currentTimeMillis();
-
-            // 等待更长时间，以增加获取BDD的机会
-            BDDEngine engine = sharedQue.poll(10, TimeUnit.SECONDS);
-
-            long waitTime = System.currentTimeMillis() - startTime;
-
-            if (engine != null) {
-                this.bddEngine = engine;
+        synchronized (sharedQue) {
+            if (sharedQue.size() != 0) {
+                try {
+                    this.bddEngine = sharedQue.take();
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
                 reused = true;
-                System.out.println("BDD引擎获取成功，等待时间: " + waitTime + "ms");
-                return true;
             }
-
-            // 如果队列为空，日志记录但不创建新引擎
-            System.out.println("警告: BDD引擎池为空，将创建新的BDD引擎，等待时间: " + waitTime + "ms");
-
-            // 返回false，让调用方创建新引擎
-            return false;
-        } catch (InterruptedException e) {
-            System.err.println("等待BDD引擎被中断: " + e.getMessage());
-            Thread.currentThread().interrupt();
-            return false;
         }
+        return reused;
     }
 
     public void setNodeBdd() {
@@ -115,27 +99,17 @@ public class TopoNet extends DVNet {
     public void startCount(LinkedBlockingDeque<BDDEngine> sharedQue) {
         Context c = new Context();
         c.topoId = this.topoCnt;
-
-        try {
-            // 执行BFS验证
-            this.getDstNode().bfsByIteration(c);
-
-            // 显示验证结果
-            for (Node node : srcNodes) {
-                node.showResult();
-            }
-        } catch (Exception e) {
-            System.err.println("验证过程出错: " + e.getMessage());
-            e.printStackTrace();
-        } finally {
-            // 无论成功还是失败，始终归还BDD引擎
-            if (sharedQue != null && this.bddEngine != null) {
-                try {
-                    sharedQue.put(this.bddEngine);
-                    //System.out.println("归还BDD引擎到池中");
-                } catch (Exception ex) {
-                    //System.err.println("归还BDD引擎失败: " + ex.getMessage());
-                }
+        // dfs or bfs
+        // this.getDstNode().startCountByDfs(c);
+        this.getDstNode().bfsByIteration(c);
+        for (Node node : srcNodes) {
+            node.showResult();
+        }
+        synchronized (sharedQue) {
+            try {
+                sharedQue.put(this.getBddEngine());
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
             }
         }
     }
@@ -144,5 +118,4 @@ public class TopoNet extends DVNet {
         srcNodes = new HashSet<>();
         this.nodesTable = new HashMap<>();
     }
-
 }

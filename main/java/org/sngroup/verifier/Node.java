@@ -118,37 +118,46 @@ public class Node {
         return topoNet.srcNodes.contains(this);
     }
 
-    /**
-     * 根据输入的公告更新locCib
-     */
-     public boolean updateLocCibByTopo(String from, Collection<Announcement> announcements) {
+    public boolean updateLocCibByTopo(String from, Collection<Announcement> announcements) {
+        // System.out.println("端口 " + from + " 的 announcements 数量: " + announcements.size());
+        
         boolean newResult = false;
         Queue<CibTuple> queue = new LinkedList<>(portToCib.get(from));
+        // System.out.println("port to cib 计数 " + portToCib.size());
+        // System.out.println("端口 " + from + " 的初始 queue 大小: " + portToCib.get(from).size());
         if(queue.size() == 0) return true;
-
         while (!queue.isEmpty()) {
             CibTuple cibTuple = queue.poll();
-
+            // System.out.println("节点 " + from + " 的当前 queue 大小: " + queue.size());
+            
             for (Announcement announcement : announcements) {
                 int intersection = bdd.ref(bdd.and(announcement.predicate, cibTuple.predicate));
                 if (intersection != cibTuple.predicate) {
-                    CibTuple newCibTuple = cibTuple.keepAndSplit(intersection, bdd);
+                    // System.out.println("节点 " + from + " 的交集计算失败: 原始谓词 " + cibTuple.predicate + ", 新交集 " + intersection);
+                    CibTuple newCibTuple = cibTuple.keepAndSplit(intersection, bdd); // 拆分CIBTuple
                     addCib(newCibTuple);
                     if (!hasResult && todoList.contains(cibTuple))
                         todoList.add(newCibTuple);
                     queue.add(newCibTuple);
+                    // System.out.println("节点 " + from + " 的 queue 大小在添加 newCibTuple 后: " + queue.size());
                     return false;
                 }
                 newResult |= cibTuple.set(from, new Count(announcement.count));
+                // newResult = true;
                 if (cibTuple.isDefinite()) {
                     todoList.remove(cibTuple);
+                    // System.out.println("节点 " + from + " 的 CIBTuple 已确定，移出 todoList。");
                     break;
                 }
             }
         }
-
+        if (!newResult) {
+            // System.out.println("节点 " + from + " 的交集计算未产生新结果。");
+        }
         return newResult;
     }
+    
+    
 
     protected void addCib(CibTuple cib) {
         locCib.add(cib);
@@ -212,6 +221,9 @@ public class Node {
         return cibOut;
     }
 
+    // ---------------------------------------------------------
+    // 接收+发送------------------------------------------------------
+
     public void bfsByIteration(Context c) {
         Announcement a = new Announcement(0, getPacketSpace(), Utility.getOneNumVector(1));
         Vector<Announcement> al = new Vector<>();
@@ -219,38 +231,43 @@ public class Node {
         CibMessage cibOut = new CibMessage(al, new ArrayList<>(), index);
         c.setCib(cibOut);
         c.setDeviceName(deviceName);
-
-        // 记录已访问路径
+        // 记录访问路径
         Set<String> visited = new HashSet<>();
         Queue<Context> queue = new LinkedList<>(); // 使用队列替换栈
         queue.add(c);
-
+        // int bfsCnt = 0;
+        // int checkCount = 0;
         int bfsCnt = 0;
         int ctxCnt = 0;
         int checkCnt = 0;
         System.out.println("终结点开始验证: " + c.getDeviceName());
-
+    
         while (!queue.isEmpty()) {
             bfsCnt++;
             int size = queue.size();
-
+            // System.out.println("当前层数中的节点" + size);
             for (int i = 0; i < size; i++) {
                 Context currentCtx = queue.poll(); // 出队列
                 String curDeviceName = currentCtx.getDeviceName();
                 visited.add(curDeviceName);
-
+                // System.out.println("BFS层次: " + bfsCnt + ", 当前设备: " + curDeviceName);
                 HashSet<DevicePort> ps = TopoNet.devicePortsTopo.get(curDeviceName);
-
+    
+                int satisfiedCount = 0;
+    
                 if (ps != null) {
+                    // System.out.println("当前设备的端口数量: " + ps.size());
                     for (DevicePort p : ps) {
                         if (p.portName.equals("temp")) {
+                            System.out.println("temptemptemptemp");
                             continue;
                         }
                         DevicePort dst = topology.get(p);
                         if (dst != null) {
                             String dstDeviceName = dst.deviceName;
+                            // System.out.println("检查下一跳结点: " + dstDeviceName);
                             checkCnt++;
-
+    
                             if (!visited.contains(dstDeviceName)) {
                                 Node dstNode = this.topoNet.getDstNodeByName(dst.deviceName);
                                 Context ctx = new Context();
@@ -258,10 +275,11 @@ public class Node {
                                 int topoId = currentCtx.topoId;
                                 ctx.setTopoId(topoId);
                                 NodePointer np = new NodePointer(dst.getPortName(), topoId);
-
+    
                                 if (dstNode.countCheckByTopo(np, currentCtx)) {
                                     ctxCnt++;
-
+                                    satisfiedCount++;
+                                    // System.out.println("节点满足条件: " + dstNode.deviceName);
                                     List<Announcement> announcements = new LinkedList<>();
                                     Map<Count, Integer> nextCibOut = dstNode.getCibOut();
                                     for (Map.Entry<Count, Integer> entry : nextCibOut.entrySet())
@@ -270,42 +288,55 @@ public class Node {
                                     ctx.setCib(cibMessage);
                                     ctx.setDeviceName(dstNode.deviceName);
                                     queue.add(ctx); // 入队列
-                                    visited.add(dst.deviceName); // 标记为已访问
+                                    visited.add(dst.deviceName); // 访问标记放在这里
+                                } else {
+                                    // System.out.println("节点不满足条件: " + dstNode.deviceName);
                                 }
+                            } else {
+                                // System.out.println("节点已访问: " + dstDeviceName);
                             }
+                        } else {
+                            // System.out.println("没有找到目标端口: " + p.toString());
                         }
                     }
+                } else {
+                    // System.out.println("当前设备没有端口信息: " + curDeviceName);
                 }
+    
+                // System.out.println("节点 " + curDeviceName + " 结束后满足条件的节点个数: " + satisfiedCount);
             }
         }
-
         System.out.println("BFS结束，总遍历次数: " + bfsCnt + ", 满足条件的节点数: " + ctxCnt + ", 总检查次数: " + checkCnt);
     }
+    
 
-    /**
-     * 检查目标节点是否满足拓扑条件
-     */
     protected boolean countCheckByTopo(NodePointer from, Context ctx) {
         CibMessage message = ctx.getCib();
         if (message != null) {
             // 1. 交集检查
             if (locCib.size() == 0) {
+                // System.out.println("节点 " + this.deviceName + " 的 locCib 为空，无法继续传播。");
                 return false;
             }
             if (!updateLocCibByTopo(from.name, message.announcements)) {
+                // System.out.println("节点 " + this.deviceName + " 无法更新 locCib，交集检查失败。");
                 return false;
             }
             // 2. 检查是否到达接入层结点
             if (checkIsSrcNode()) {
+                // System.out.println("节点 " + this.deviceName + " 到达接入层结点，停止传播。");
                 return false;
             }
             // 3. 拓扑排序, 只在满足todolist时继续传播
             if (!hasResult && todoList.isEmpty()) {
+                // System.out.println("节点 " + this.deviceName + " 拓扑排序结果为空，继续传播。");
                 return true;
             }
         }
+        // System.out.println("节点 " + this.deviceName + " 无法满足传播条件，停止传播。");
         return false;
     }
+    
 
     public void sendFirstResultByTopo(Context ctx, Set<String> visited) {
         List<Announcement> announcements = new LinkedList<>();
@@ -406,12 +437,12 @@ public class Node {
                 });
             }
 
-            //if (success[0]) {
+            if (success[0]) {
                 System.out.println("invariants: (" + invariant.getMatch() + ", " + invariant.getPath()
                         + ", packet space:" + topoNet.packetSpace + ") , result: " + success[0]);
                 System.out.println("Num of DPVnets been verified: " + numDpvnet.getAndIncrement());
                 // System.out.println("到达的节点名字" + this.deviceName);
-           // }
+            }
             // try {
             // // 加锁
             //
